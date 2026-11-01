@@ -38,6 +38,11 @@ on:
         type: string
         required: false
         default: release:2026.1.13
+      ignore-disable-label:
+        description: 'Run integration tests even when the PR has disable-integration-tests'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: integration-tests-${{ github.workflow }}-${{ github.ref }}
@@ -46,7 +51,7 @@ concurrency:
 jobs:
   tests:
     name: test ${{ matrix.event_loop_manager }} (${{ matrix.python-version }})
-    if: "!contains(github.event.pull_request.labels.*.name, 'disable-integration-tests')"
+    if: "inputs.ignore-disable-label || !contains(github.event.pull_request.labels.*.name, 'disable-integration-tests')"
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:

@@ -53,6 +53,7 @@ jobs:
     uses: ./.github/workflows/integration-tests.yml
     with:
       scylla-version: release:${{ needs.scylla-release.outputs.version }}
+      ignore-disable-label: true
 
   scylla-release:
     name: Resolve stable Scylla and split test.py suites
@@ -70,6 +71,8 @@ jobs:
       toolchain: ${{ steps.plan.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve latest stable release tag once
         id: release
@@ -113,6 +116,8 @@ jobs:
       TESTPY_LOG_DIR: ${{ github.workspace }}/scylla-testpy-logs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Check out matching release tests
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -147,6 +152,7 @@ jobs:
         run: docker pull "$SCYLLA_TOOLCHAIN"
 
       - name: Fetch Scylla with CCM and run test.py shard
+        shell: bash
         run: |
           mkdir -p "$TESTPY_LOG_DIR"
           cd "$SCYLLA_SOURCE"
@@ -160,12 +166,20 @@ jobs:
 
       - name: Archive Scylla test reports and logs
         if: always()
+        shell: bash
         run: |
           if [[ -d "$TESTPY_LOG_DIR" ]]; then
             cd "$TESTPY_LOG_DIR"
             # Pytest parameter IDs can contain characters rejected by artifact
             # upload (e.g. vector<float, 3>). Preserve those paths inside a tarball.
-            find . -type f \( -name '*.log' -o -name '*.txt' -o -path './tests/report/*' \) \
+            # Server workdirs contain data as well as diagnostic logs. Prune
+            # their storage directories without excluding report/data.
+            find . -type d \( \
+              -path './tests/*/scylla-*/data' -o \
+              -path './tests/*/scylla-*/commitlog' -o \
+              -path './tests/*/scylla-*/hints' -o \
+              -path './tests/*/scylla-*/view_hints' \) -prune -o \
+              -type f \( -name '*.log' -o -name '*.txt' -o -path './tests/report/*' \) \
               -print0 | tar --null -T - -czf "$RUNNER_TEMP/scylla-testpy-logs.tar.gz"
           fi
 

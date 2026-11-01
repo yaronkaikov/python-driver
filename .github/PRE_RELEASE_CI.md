@@ -4,12 +4,14 @@ Add the `pre-release-ci` label to a PR to run full wheel builds/tests, the drive
 integration matrix, and Scylla's Python/CQL tests in GitHub Actions. Adding the
 label starts the workflow; pushes and reopening the labeled PR run it again.
 Removing the label cancels its run. Unrelated label changes do not restart it.
-Manual runs are also available. This workflow does not publish packages.
+Manual runs are also available. The driver integration matrix runs even when
+the PR has the `disable-integration-tests` label. This workflow does not publish
+packages.
 
 ## Stable release selection
 
 Preparation resolves the highest numeric final `scylla-X.Y.Z` tag once, excluding
-RC and candidate tags, and pins its commit for the entire run. Every test job
+RC and candidate tags, and pins its commit for the entire run. Each Scylla test job
 checks out that commit and uses its own `tools/toolchain/image` through the
 upstream `tools/toolchain/dbuild` launcher.
 

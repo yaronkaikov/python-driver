@@ -42,7 +42,15 @@ PY
 )
 # Backports can add Python dependencies after the frozen image was published.
 # Use the release's own dependency list, excluding the driver being replaced.
-read -r -a upstream_packages <<< "$(bash install-dependencies.sh --print-pip-runtime-packages)"
+if ! upstream_package_list=$(bash install-dependencies.sh --print-pip-runtime-packages); then
+    echo 'Failed to discover upstream Python runtime dependencies' >&2
+    exit 1
+fi
+read -r -a upstream_packages <<< "$upstream_package_list"
+if [[ ${#upstream_packages[@]} == 0 ]]; then
+    echo 'Upstream Python runtime dependency list is empty' >&2
+    exit 1
+fi
 test_packages=()
 for package in "${upstream_packages[@]}"; do
     if [[ "$package" != scylla-driver ]]; then
