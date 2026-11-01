@@ -1,27 +1,54 @@
 #!/usr/bin/env bash
-# Called inside the frozen toolchain from the selected release tag.
+# Run inside the shared image built from the pinned Scylla master commit.
 set -euo pipefail
 
-: "${SCYLLA_SOURCE:?Set SCYLLA_SOURCE to the matching Scylla checkout}"
+: "${SCYLLA_SOURCE:?Set SCYLLA_SOURCE to the built Scylla checkout in the image}"
 : "${DRIVER_WHEEL_DIR:?Set DRIVER_WHEEL_DIR to the candidate wheel directory}"
 : "${TESTPY_LOG_DIR:?Set TESTPY_LOG_DIR to the output directory}"
-: "${SCYLLA_RELEASE_FILE:?Set SCYLLA_RELEASE_FILE to the resolved release JSON}"
+: "${SCYLLA_SOURCE_FILE:?Set SCYLLA_SOURCE_FILE to the pinned source JSON}"
 : "${SCYLLA_PLAN_FILE:?Set SCYLLA_PLAN_FILE to the suite/shard plan JSON}"
 : "${SCYLLA_TEST_JOB:?Set SCYLLA_TEST_JOB to a name from the plan}"
 
-driver_scripts=$(realpath "$(dirname "$0")")
 SCYLLA_SOURCE=$(realpath "$SCYLLA_SOURCE")
 DRIVER_WHEEL_DIR=$(realpath "$DRIVER_WHEEL_DIR")
 mkdir -p "$TESTPY_LOG_DIR/pytest-tmp"
 TESTPY_LOG_DIR=$(realpath "$TESTPY_LOG_DIR")
-export PYTEST_DEBUG_TEMPROOT="$TESTPY_LOG_DIR/pytest-tmp"
-export CCM_CONFIG_DIR="$SCYLLA_SOURCE/build/ccm"
+# Some upstream fixtures put AF_UNIX sockets below pytest's temporary root.
+# Keep that root short even when the mounted diagnostics path is long.
+pytest_tmp=$(mktemp -d /tmp/tpy.XXXXXX)
+save_pytest_tmp() {
+    status=$?
+    trap - EXIT
+    cp -a "$pytest_tmp/." "$TESTPY_LOG_DIR/pytest-tmp/" || status=1
+    rm -rf -- "$pytest_tmp"
+    exit "$status"
+}
+trap save_pytest_tmp EXIT
+export PYTEST_DEBUG_TEMPROOT="$pytest_tmp"
 unset PYTHONPATH PYTHONHOME
 cd "$SCYLLA_SOURCE"
-
-# Retain the release toolchain's test dependencies while overriding its driver.
-python3 -m venv --system-site-packages build/driver-candidate-venv
 test_python="$SCYLLA_SOURCE/build/driver-candidate-venv/bin/python"
+# Dependencies are synced from upstream's lockfile when the image is built.
+# Bypass test.py's auto-sync after replacing its pinned upstream driver.
+export DISABLE_VENV=1
+
+"$test_python" - "$SCYLLA_SOURCE_FILE" <<'PY' | tee "$TESTPY_LOG_DIR/scylla.txt"
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+source = json.loads(Path(sys.argv[1]).read_text())
+metadata = json.loads(Path('.driver-image.json').read_text())
+assert metadata['revision'] == source['revision'], (metadata, source)
+binary = Path(metadata['binary'])
+assert binary.samefile('build/RelWithDebInfo/scylla'), binary
+with binary.open('rb') as stream:
+    assert hashlib.file_digest(stream, 'sha256').hexdigest() == metadata['binary_sha256']
+assert subprocess.check_output([str(binary), '--version'], text=True).strip() == metadata['binary_version']
+print(json.dumps(metadata, indent=2))
+PY
 
 candidate_wheel=$("$test_python" - "$DRIVER_WHEEL_DIR" <<'PY'
 from pathlib import Path
@@ -40,27 +67,7 @@ if len(candidates) != 1:
 print(candidates[0])
 PY
 )
-# Backports can add Python dependencies after the frozen image was published.
-# Use the release's own dependency list, excluding the driver being replaced.
-if ! upstream_package_list=$(bash install-dependencies.sh --print-pip-runtime-packages); then
-    echo 'Failed to discover upstream Python runtime dependencies' >&2
-    exit 1
-fi
-read -r -a upstream_packages <<< "$upstream_package_list"
-if [[ ${#upstream_packages[@]} == 0 ]]; then
-    echo 'Upstream Python runtime dependency list is empty' >&2
-    exit 1
-fi
-test_packages=()
-for package in "${upstream_packages[@]}"; do
-    if [[ "$package" != scylla-driver ]]; then
-        test_packages+=("$package")
-    fi
-done
-"$test_python" -m pip install \
-    'ccm @ git+https://github.com/scylladb/scylla-ccm.git@a9f43b03089fc8931bb9b542ae7c64273e8c64a9' \
-    "${test_packages[@]}"
-"$test_python" -m pip install --force-reinstall "$candidate_wheel"
+uv pip install --python "$test_python" --no-deps --force-reinstall "$candidate_wheel"
 
 "$test_python" - "$candidate_wheel" <<'PY' | tee "$TESTPY_LOG_DIR/driver.txt"
 from importlib.metadata import distribution
@@ -88,39 +95,22 @@ with wheel.open('rb') as stream:
     print(f'SHA256: {hashlib.file_digest(stream, "sha256").hexdigest()}')
 PY
 
-suite=$("$test_python" - "$SCYLLA_PLAN_FILE" "$SCYLLA_TEST_JOB" <<'PY'
+test_files=$("$test_python" - "$SCYLLA_PLAN_FILE" "$SCYLLA_TEST_JOB" <<'PY'
 import json
 import sys
-jobs = json.load(open(sys.argv[1]))
-print(next(job['suite'] for job in jobs if job['name'] == sys.argv[2]))
-PY
-)
-fetch_args=(--release "$SCYLLA_RELEASE_FILE" --source "$SCYLLA_SOURCE")
-if [[ "$suite" == scylla_gdb ]]; then
-    fetch_args+=(--symbols)
-fi
-"$test_python" -u "$driver_scripts/scylla_release.py" fetch "${fetch_args[@]}" \
-    2>&1 | tee "$TESTPY_LOG_DIR/ccm.log"
 
-if [[ "$suite" == cqlpy ]]; then
-    bash "$driver_scripts/build_scylla_wasm.sh" "$SCYLLA_SOURCE"
-fi
-
-mapfile -t test_paths < <("$test_python" - "$SCYLLA_PLAN_FILE" "$SCYLLA_TEST_JOB" <<'PY'
-import json
-import sys
-jobs = json.load(open(sys.argv[1]))
+with open(sys.argv[1]) as stream:
+    jobs = json.load(stream)
 print('\n'.join(next(job['files'] for job in jobs if job['name'] == sys.argv[2])))
 PY
 )
-if [[ ${#test_paths[@]} == 0 ]]; then
+if [[ -z "$test_files" ]]; then
     echo 'No test files assigned to this job' >&2
     exit 1
 fi
+mapfile -t test_paths <<< "$test_files"
 printf '%s\n' "${test_paths[@]}" > "$TESTPY_LOG_DIR/test-files.txt"
 # Explicit release mode preserves upstream run_in/skip_in and skip_mode rules.
-# Invoke this interpreter directly so newer harnesses cannot restore their driver.
-export DISABLE_VENV=1
 "$test_python" test.py --mode release --no-gather-metrics --jobs 1 \
     --timeout 1800 --session-timeout 9000 --markers 'not non_gating' \
     --tmpdir "$TESTPY_LOG_DIR/tests" --save-log-on-success \
