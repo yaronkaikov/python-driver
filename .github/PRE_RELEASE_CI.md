@@ -49,9 +49,11 @@ are excluded. This does not reproduce Jenkins' dev/debug or ARM build matrices.
 
 ## Results and local runs
 
-Each `scylla-testpy-<suite>-<shard>-logs` artifact contains candidate identity,
-CCM package identity, selected test paths, console output, JUnit/Allure reports,
-and test/server logs. Server data directories are not uploaded.
+Each `scylla-testpy-<suite>-<shard>-logs` artifact contains a tarball with candidate
+identity, CCM package identity, selected test paths, console output, JUnit/Allure
+reports, and test/server logs. The tarball preserves pytest parameter names that
+artifact upload cannot accept as individual filenames. Server data directories
+are not uploaded.
 
 Prepare the same inputs locally:
 

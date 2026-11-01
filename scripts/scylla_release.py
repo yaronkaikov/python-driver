@@ -51,7 +51,7 @@ def test_plan(source):
                     name.startswith('test_') or name.endswith(('_test.py', '_tests.py'))
                 )) or name.endswith('_test.cql')
             ):
-                files.append(str(path.relative_to(source)))
+                files.append(path.relative_to(source).as_posix())
         if not files:
             continue
         shards = min(SUITE_SHARDS.get(directory.name, 1), len(files))

@@ -120,7 +120,8 @@ class PackageIdentityTest(unittest.TestCase):
                 self.repository.download_version.call_args.kwargs['url'],
                 unified.replace('/scylla-unified-', '/scylla-unstripped-'),
             )
-            self.assertEqual(
-                (source / 'build/RelWithDebInfo/scylla').readlink(),
-                source / 'build/gdb-runtime/libexec/scylla',
-            )
+            target = source / 'build/gdb-runtime/libexec/scylla'
+            target.parent.mkdir(parents=True)
+            target.touch()
+            # Windows may return an extended-length path from readlink().
+            self.assertTrue((source / 'build/RelWithDebInfo/scylla').samefile(target))

@@ -158,17 +158,23 @@ jobs:
             -- bash "$GITHUB_WORKSPACE/scripts/run_scylla_testpy.sh" \
             2>&1 | tee "$TESTPY_LOG_DIR/bootstrap.log"
 
+      - name: Archive Scylla test reports and logs
+        if: always()
+        run: |
+          if [[ -d "$TESTPY_LOG_DIR" ]]; then
+            cd "$TESTPY_LOG_DIR"
+            # Pytest parameter IDs can contain characters rejected by artifact
+            # upload (e.g. vector<float, 3>). Preserve those paths inside a tarball.
+            find . -type f \( -name '*.log' -o -name '*.txt' -o -path './tests/report/*' \) \
+              -print0 | tar --null -T - -czf "$RUNNER_TEMP/scylla-testpy-logs.tar.gz"
+          fi
+
       - name: Upload Scylla test reports and logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scylla-testpy-${{ matrix.name }}-logs
-          path: |
-            ${{ github.workspace }}/scylla-testpy-logs/*.log
-            ${{ github.workspace }}/scylla-testpy-logs/*.txt
-            ${{ github.workspace }}/scylla-testpy-logs/tests/report
-            ${{ github.workspace }}/scylla-testpy-logs/tests/pytest_log
-            ${{ github.workspace }}/scylla-testpy-logs/tests/pytest_tests_logs
-            ${{ github.workspace }}/scylla-testpy-logs/tests/**/*.log
+          path: ${{ runner.temp }}/scylla-testpy-logs.tar.gz
+          compression-level: 0
           if-no-files-found: warn
           retention-days: 7
