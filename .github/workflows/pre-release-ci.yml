@@ -20,99 +20,155 @@ concurrency:
 
 jobs:
   wheels:
-    name: Full wheel builds and tests
+    name: Linux wheel builds and tests
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (contains(github.event.pull_request.labels.*.name, 'pre-release-ci') &&
        (github.event.action != 'labeled' || github.event.label.name == 'pre-release-ci') &&
        github.event.action != 'unlabeled')
     uses: ./.github/workflows/lib-build.yml
+    with:
+      target: linux
+
+  other-wheels:
+    name: Other platform wheel builds and tests
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'pre-release-ci') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'pre-release-ci') &&
+       github.event.action != 'unlabeled')
+    uses: ./.github/workflows/lib-build.yml
+    with:
+      target: macos-x86,macos-arm,windows,linux-aarch64
+      build-sdist: false
 
   integration:
     name: Driver integration tests
+    needs: scylla-release
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (contains(github.event.pull_request.labels.*.name, 'pre-release-ci') &&
        (github.event.action != 'labeled' || github.event.label.name == 'pre-release-ci') &&
        github.event.action != 'unlabeled')
     uses: ./.github/workflows/integration-tests.yml
+    with:
+      scylla-version: release:${{ needs.scylla-release.outputs.version }}
 
-  scylla-testpy:
-    name: Scylla CQL tests with candidate wheel
-    needs: wheels
+  scylla-release:
+    name: Resolve stable Scylla and split test.py suites
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'pre-release-ci') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'pre-release-ci') &&
+       github.event.action != 'unlabeled')
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      # Keep source and relocatable build on the same revision. Use a dev build
-      # so CQL tests can exercise error injection as well as normal requests.
-      SCYLLA_REVISION: da8d276b4eadb66327e912b46a0530c3e2d1da50
-      SCYLLA_EXE_URL: https://s3.amazonaws.com/downloads.scylladb.com/unstable/scylla/master/relocatable/2026-10-31T20:09:31Z/scylla-dev-2027.1.0~dev-0.20261031.da8d276b4ead.x86_64.tar.gz
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      revision: ${{ steps.release.outputs.revision }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      toolchain: ${{ steps.plan.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Check out matching Scylla tests
+      - name: Resolve latest stable release tag once
+        id: release
+        run: |
+          mkdir scylla-plan
+          python3 scripts/scylla_release.py resolve --output scylla-plan/release.json
+
+      - name: Check out matching release tests
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: scylladb/scylladb
-          ref: ${{ env.SCYLLA_REVISION }}
+          ref: ${{ steps.release.outputs.revision }}
           path: scylla-tests
           persist-credentials: false
 
-      - name: Download Linux candidate wheels
+      - name: Split every Python and CQL suite into jobs
+        id: plan
+        run: |
+          python3 scripts/scylla_release.py plan scylla-tests --output scylla-plan/jobs.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scylla-test-plan
+          path: scylla-plan
+
+  scylla-testpy:
+    name: Scylla test.py / ${{ matrix.name }}
+    needs: [wheels, scylla-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.scylla-release.outputs.matrix) }}
+    env:
+      SCYLLA_SOURCE: ${{ github.workspace }}/scylla-tests
+      DRIVER_WHEEL_DIR: ${{ github.workspace }}/candidate-wheels
+      SCYLLA_RELEASE_FILE: ${{ github.workspace }}/scylla-plan/release.json
+      SCYLLA_PLAN_FILE: ${{ github.workspace }}/scylla-plan/jobs.json
+      SCYLLA_TEST_JOB: ${{ matrix.name }}
+      TESTPY_LOG_DIR: ${{ github.workspace }}/scylla-testpy-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check out matching release tests
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: scylladb/scylladb
+          ref: ${{ needs.scylla-release.outputs.revision }}
+          path: scylla-tests
+          persist-credentials: false
+
+      - name: Fetch test helper submodules
+        run: git -C scylla-tests submodule update --init --depth 1 seastar tools/cqlsh
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scylla-test-plan
+          path: scylla-plan
+
+      - name: Download candidate Linux wheels
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: wheels-linux-ubuntu-24.04
           path: candidate-wheels
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-        with:
-          python-version: '3.14'
-          enable-cache: true
-          cache-dependency-glob: scylla-tests/test/uv.lock
-
-      - name: Install server and driver runtime libraries
+      - name: Make room for the release toolchain
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            libev4 libnuma1 clang lld wabt binaryen slapd ldap-utils sasl2-bin
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
 
-      - name: Prepare test.py auxiliary services
-        run: |
-          mkdir -p "$RUNNER_TEMP/testpy-bin"
-          for binary in toxiproxy-cli toxiproxy-server; do
-            curl --fail --location --retry 3 \
-              "https://github.com/Shopify/toxiproxy/releases/download/v2.12.0/$binary-linux-amd64" \
-              -o "$RUNNER_TEMP/testpy-bin/$binary"
-            chmod +x "$RUNNER_TEMP/testpy-bin/$binary"
-          done
-          # A private copy avoids Ubuntu's system slapd AppArmor profile, which
-          # denies the temporary config/data directories created by test.py.
-          cp /usr/sbin/slapd "$RUNNER_TEMP/testpy-bin/slapd"
-          echo "$RUNNER_TEMP/testpy-bin" >> "$GITHUB_PATH"
-          # Upstream's LDAP fixture assumes Fedora paths and a built-in MDB
-          # backend. Ubuntu ships the same backend as a dynamically loaded module.
-          sed -i 's@/etc/openldap/schema/@/etc/ldap/schema/@g' \
-            scylla-tests/test/resource/slapd.conf
-          sed -i '1i modulepath /usr/lib/ldap\nmoduleload back_mdb' \
-            scylla-tests/test/resource/slapd.conf
-
-      - name: Prepare Wasm fixtures for CQL tests
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal --target wasm32-wasip1
-          bash scripts/build_scylla_wasm.sh "$GITHUB_WORKSPACE/scylla-tests"
-
-      - name: Run Scylla CQL suite
+      - name: Pull this release's frozen toolchain
         env:
-          SCYLLA_SOURCE: ${{ github.workspace }}/scylla-tests
-          DRIVER_WHEEL_DIR: ${{ github.workspace }}/candidate-wheels
-          TESTPY_LOG_DIR: ${{ runner.temp }}/scylla-testpy-logs
-        run: bash scripts/run_scylla_testpy.sh
+          SCYLLA_TOOLCHAIN: ${{ needs.scylla-release.outputs.toolchain }}
+        run: docker pull "$SCYLLA_TOOLCHAIN"
+
+      - name: Fetch Scylla with CCM and run test.py shard
+        run: |
+          mkdir -p "$TESTPY_LOG_DIR"
+          cd "$SCYLLA_SOURCE"
+          ./tools/toolchain/dbuild \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            -e SCYLLA_SOURCE -e DRIVER_WHEEL_DIR -e TESTPY_LOG_DIR \
+            -e SCYLLA_RELEASE_FILE -e SCYLLA_PLAN_FILE -e SCYLLA_TEST_JOB \
+            -- bash "$GITHUB_WORKSPACE/scripts/run_scylla_testpy.sh" \
+            2>&1 | tee "$TESTPY_LOG_DIR/bootstrap.log"
 
       - name: Upload Scylla test reports and logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scylla-testpy-logs
-          path: ${{ runner.temp }}/scylla-testpy-logs
+          name: scylla-testpy-${{ matrix.name }}-logs
+          path: |
+            ${{ github.workspace }}/scylla-testpy-logs/*.log
+            ${{ github.workspace }}/scylla-testpy-logs/*.txt
+            ${{ github.workspace }}/scylla-testpy-logs/tests/report
+            ${{ github.workspace }}/scylla-testpy-logs/tests/pytest_log
+            ${{ github.workspace }}/scylla-testpy-logs/tests/pytest_tests_logs
+            ${{ github.workspace }}/scylla-testpy-logs/tests/**/*.log
           if-no-files-found: warn
+          retention-days: 7

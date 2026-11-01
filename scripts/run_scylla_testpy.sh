@@ -1,32 +1,31 @@
 #!/usr/bin/env bash
-# Run Scylla's in-tree CQL suite with a wheel from this driver's build.
+# Called inside the frozen toolchain from the selected release tag.
 set -euo pipefail
 
 : "${SCYLLA_SOURCE:?Set SCYLLA_SOURCE to the matching Scylla checkout}"
-: "${SCYLLA_EXE_URL:?Set SCYLLA_EXE_URL to the matching relocatable server URL}"
 : "${DRIVER_WHEEL_DIR:?Set DRIVER_WHEEL_DIR to the candidate wheel directory}"
-: "${TESTPY_LOG_DIR:?Set TESTPY_LOG_DIR to an absolute output directory}"
+: "${TESTPY_LOG_DIR:?Set TESTPY_LOG_DIR to the output directory}"
+: "${SCYLLA_RELEASE_FILE:?Set SCYLLA_RELEASE_FILE to the resolved release JSON}"
+: "${SCYLLA_PLAN_FILE:?Set SCYLLA_PLAN_FILE to the suite/shard plan JSON}"
+: "${SCYLLA_TEST_JOB:?Set SCYLLA_TEST_JOB to a name from the plan}"
 
+driver_scripts=$(realpath "$(dirname "$0")")
 SCYLLA_SOURCE=$(realpath "$SCYLLA_SOURCE")
 DRIVER_WHEEL_DIR=$(realpath "$DRIVER_WHEEL_DIR")
-mkdir -p "$TESTPY_LOG_DIR"
-TESTPY_LOG_DIR=$(realpath "$TESTPY_LOG_DIR")
 mkdir -p "$TESTPY_LOG_DIR/pytest-tmp"
+TESTPY_LOG_DIR=$(realpath "$TESTPY_LOG_DIR")
 export PYTEST_DEBUG_TEMPROOT="$TESTPY_LOG_DIR/pytest-tmp"
-export UV_PROJECT_ENVIRONMENT="$SCYLLA_SOURCE/build/driver-candidate-venv"
-test_python="$UV_PROJECT_ENVIRONMENT/bin/python"
-
-# Prevent the driver checkout or a caller's environment from shadowing the wheel.
+export CCM_CONFIG_DIR="$SCYLLA_SOURCE/build/ccm"
 unset PYTHONPATH PYTHONHOME
 cd "$SCYLLA_SOURCE"
 
-uv sync --project test --locked --no-dev --python 3.14
+# Retain the release toolchain's test dependencies while overriding its driver.
+python3 -m venv --system-site-packages build/driver-candidate-venv
+test_python="$SCYLLA_SOURCE/build/driver-candidate-venv/bin/python"
 
-# Select by Python ABI and platform; never let pip fall back to a PyPI driver.
 candidate_wheel=$("$test_python" - "$DRIVER_WHEEL_DIR" <<'PY'
 from pathlib import Path
 import sys
-
 from packaging.tags import sys_tags
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
@@ -41,16 +40,26 @@ if len(candidates) != 1:
 print(candidates[0])
 PY
 )
-uv pip install --python "$test_python" --reinstall "$candidate_wheel"
+# Backports can add Python dependencies after the frozen image was published.
+# Use the release's own dependency list, excluding the driver being replaced.
+read -r -a upstream_packages <<< "$(bash install-dependencies.sh --print-pip-runtime-packages)"
+test_packages=()
+for package in "${upstream_packages[@]}"; do
+    if [[ "$package" != scylla-driver ]]; then
+        test_packages+=("$package")
+    fi
+done
+"$test_python" -m pip install \
+    'ccm @ git+https://github.com/scylladb/scylla-ccm.git@a9f43b03089fc8931bb9b542ae7c64273e8c64a9' \
+    "${test_packages[@]}"
+"$test_python" -m pip install --force-reinstall "$candidate_wheel"
 
-# Record proof that the candidate wheel, including its compiled modules, is used.
 "$test_python" - "$candidate_wheel" <<'PY' | tee "$TESTPY_LOG_DIR/driver.txt"
 from importlib.metadata import distribution
 from pathlib import Path
 import hashlib
 import json
 import sys
-
 import cassandra
 import cassandra.cluster
 import cassandra.protocol
@@ -71,14 +80,40 @@ with wheel.open('rb') as stream:
     print(f'SHA256: {hashlib.file_digest(stream, "sha256").hexdigest()}')
 PY
 
-# test.py normally re-syncs the pinned upstream driver. Bypass that sync after
-# installing the candidate, and invoke this interpreter directly (not uv run).
-export DISABLE_VENV=1
-test_paths=("$@")
-if [[ ${#test_paths[@]} == 0 ]]; then
-    test_paths=(test/cqlpy)
+suite=$("$test_python" - "$SCYLLA_PLAN_FILE" "$SCYLLA_TEST_JOB" <<'PY'
+import json
+import sys
+jobs = json.load(open(sys.argv[1]))
+print(next(job['suite'] for job in jobs if job['name'] == sys.argv[2]))
+PY
+)
+fetch_args=(--release "$SCYLLA_RELEASE_FILE" --source "$SCYLLA_SOURCE")
+if [[ "$suite" == scylla_gdb ]]; then
+    fetch_args+=(--symbols)
 fi
-"$test_python" test.py --exe-url "$SCYLLA_EXE_URL" \
-    --no-gather-metrics --jobs 2 --timeout 600 --session-timeout 5400 \
-    --markers 'not non_gating' --tmpdir "$TESTPY_LOG_DIR/tests" \
-    --save-log-on-success "${test_paths[@]}" 2>&1 | tee "$TESTPY_LOG_DIR/console.log"
+"$test_python" -u "$driver_scripts/scylla_release.py" fetch "${fetch_args[@]}" \
+    2>&1 | tee "$TESTPY_LOG_DIR/ccm.log"
+
+if [[ "$suite" == cqlpy ]]; then
+    bash "$driver_scripts/build_scylla_wasm.sh" "$SCYLLA_SOURCE"
+fi
+
+mapfile -t test_paths < <("$test_python" - "$SCYLLA_PLAN_FILE" "$SCYLLA_TEST_JOB" <<'PY'
+import json
+import sys
+jobs = json.load(open(sys.argv[1]))
+print('\n'.join(next(job['files'] for job in jobs if job['name'] == sys.argv[2])))
+PY
+)
+if [[ ${#test_paths[@]} == 0 ]]; then
+    echo 'No test files assigned to this job' >&2
+    exit 1
+fi
+printf '%s\n' "${test_paths[@]}" > "$TESTPY_LOG_DIR/test-files.txt"
+# Explicit release mode preserves upstream run_in/skip_in and skip_mode rules.
+# Invoke this interpreter directly so newer harnesses cannot restore their driver.
+export DISABLE_VENV=1
+"$test_python" test.py --mode release --no-gather-metrics --jobs 1 \
+    --timeout 1800 --session-timeout 9000 --markers 'not non_gating' \
+    --tmpdir "$TESTPY_LOG_DIR/tests" --save-log-on-success \
+    "${test_paths[@]}" 2>&1 | tee "$TESTPY_LOG_DIR/console.log"

@@ -14,7 +14,7 @@ for source in test/resource/wasm/c/*.c; do
     wasm2wat "build/wasm/$name.wasm" -o "build/wasm/$name.wat"
 done
 
-cargo +1.88.0 build --target=wasm32-wasip1 --examples --locked \
+cargo build --target=wasm32-wasip1 --examples --locked \
     --manifest-path=test/resource/wasm/rust/Cargo.toml --target-dir=build/wasm
 for source in test/resource/wasm/rust/*.rs; do
     name=$(basename "$source" .rs)

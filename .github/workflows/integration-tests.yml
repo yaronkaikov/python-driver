@@ -32,6 +32,12 @@ on:
       - .github/workflows/docs-*
   workflow_dispatch:
   workflow_call:
+    inputs:
+      scylla-version:
+        description: 'CCM Scylla version selector'
+        type: string
+        required: false
+        default: release:2026.1.13
 
 concurrency:
   group: integration-tests-${{ github.workflow }}-${{ github.ref }}
@@ -44,7 +50,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      SCYLLA_VERSION: release:2026.1.13
+      SCYLLA_VERSION: ${{ inputs.scylla-version || 'release:2026.1.13' }}
     strategy:
       fail-fast: false
       matrix:
