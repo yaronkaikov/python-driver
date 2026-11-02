@@ -93,11 +93,12 @@ jobs:
       run: sudo apt-get install libev4 libev-dev
 
     - name: Install uv
-      if: inputs.scylla-image-artifact == ''
+      id: setup-uv
       uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
+        version: ${{ inputs.scylla-image-artifact != '' && '0.13.6' || '' }}
         python-version: ${{ matrix.python-version }}
-        enable-cache: true
+        enable-cache: ${{ inputs.scylla-image-artifact == '' }}
 
     - name: Build driver
       if: inputs.scylla-image-artifact == ''
@@ -145,17 +146,20 @@ jobs:
       if: inputs.scylla-image-artifact != ''
       env:
         SCYLLA_IMAGE_REFERENCE: ${{ inputs.scylla-image-reference }}
+        UV_BINARY: ${{ steps.setup-uv.outputs.uv-path }}
         PYTHON_VERSION: ${{ matrix.python-version }}
         EVENT_LOOP_MANAGER: ${{ matrix.event_loop_manager }}
       shell: bash
       run: |
         test -n "$SCYLLA_IMAGE_REFERENCE"
         docker run --rm -i --privileged --network host \
+          -v "$UV_BINARY:/usr/local/bin/uv:ro" \
           -v "$GITHUB_WORKSPACE:/driver" --workdir /driver \
           -e SCYLLA_VERSION=/opt/scylla -e CASSANDRA_DIR=/opt/scylla \
           -e PROTOCOL_VERSION=4 -e EVENT_LOOP_MANAGER -e PYTHON_VERSION \
           -e UV_PROJECT_ENVIRONMENT=/driver/.venv \
           "$SCYLLA_IMAGE_REFERENCE" bash -eu -o pipefail <<'CONTAINER'
+        uv --version
         uv python install "$PYTHON_VERSION"
         uv sync --python "$PYTHON_VERSION"
         if [[ "$PYTHON_VERSION" =~ t$ ]]; then
