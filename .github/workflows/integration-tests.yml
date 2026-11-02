@@ -156,6 +156,7 @@ jobs:
           -e PROTOCOL_VERSION=4 -e EVENT_LOOP_MANAGER -e PYTHON_VERSION \
           -e UV_PROJECT_ENVIRONMENT=/driver/.venv \
           "$SCYLLA_IMAGE_REFERENCE" bash -eu -o pipefail <<'CONTAINER'
+        uv python install "$PYTHON_VERSION"
         uv sync --python "$PYTHON_VERSION"
         if [[ "$PYTHON_VERSION" =~ t$ ]]; then
           export PYTHON_GIL=0
